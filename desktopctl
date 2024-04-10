@@ -1,0 +1,2065 @@
+#!/bin/bash
+
+# dsektopctl
+#
+# A desktop environment for window managers
+#
+# Ryan Rueger 2024
+
+shopt -s extglob
+
+# Configuration {{{{{
+if [[ -r "$HOME/.config/desktopctl/desktopctlrc" ]]
+then
+  source "$HOME/.config/desktopctl/desktopctlrc"
+fi
+
+# Battery icons
+if [[ -z BATTERY_LEVELS_CHARGING ]]
+then
+  BATTERY_LEVELS_CHARGING=(󰂆 󰂆 󰂇 󰂈 󰂉 󰂊 󰂊 󰂋 󰂋 󰂅 )
+fi
+
+if [[ -z BATTERY_LEVELS ]]
+then
+  BATTERY_LEVELS=(󰁺 󰁻 󰁼 󰁽 󰁾 󰁿 󰂀 󰂁 󰂂 󰁹 )
+fi
+
+# Window manager
+WINDOWING=${XDG_SESSION_TYPE:-x11}
+XAUTHORITY=${XAUTHORITY:-$HOME/.Xauthority}
+
+# Screenshots
+SCREENSHOTS=${SCREENSHOTS:-$HOME/.cache/screenshots}
+SCREENSHOT_SIZE=${SCREENSHOT_SZE:-1920x1080}
+
+# General
+DIFFTOOL=${DIFFTOOL:-diff}
+
+# Wifi configuration
+WIFI_ICON_OFF=${WIFI_ICON_OFF:-Off}
+WIFI_ICON_ON=${WIFI_ICON_ON:-Connected:}
+WIFI_BACKEND=${WIFI_BACKEND:-nm}
+WIFI_DEVICE=${WIFI_DEVICE:-wlan0}
+
+# Headphone indicator
+HEADPHONE_INDICATOR=${HEADPHONE_INDICATOR:-"H"}
+
+# Power statistics
+UEVENT=${UEVENT:-/sys/class/power_supply/BAT0/uevent}
+POWERSTATS=${POWERSTATS:-$HOME/.powerstats}
+
+# Backlight power levels
+# Cannot use default values syntax for arrays
+if [[ -z $BACKLIGHT_LEVELS ]]
+then
+  BACKLIGHT_LEVELS=(0 1 2 3 4 5 6 7 8 9 10 15 20 25 30 40 50 60 70 80 90 100)
+fi
+
+# Bluetooth
+BLUETOOTH_ICON_ON=${BLUETOOTH_ICON_ON:-B}
+BLUETOOTH_ICON_CONNECTED=${BLUETOOTH_ICON_CONNECTED:-Bc}
+
+# export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$UID/bus
+# export DISPLAY=:0
+# }}}}}
+
+# Logging {{{{{
+desktopctl.log () {
+    2>&1 echo "desktopctl: $*"
+}
+# }}}}}
+
+# Dependencycheck {{{{{
+desktopctl.dependencycheck () {
+  for DEPENDENCY in "$@"
+  do
+    if ! command -v "$DEPENDENCY" > /dev/null 2>&1
+    then
+      desktopctl.log "dependencycheck: Requires executable '$DEPENDENCY'"
+      exit 2
+    fi
+  done
+}
+# }}}}}
+# Sudocheck {{{{{
+desktopctl.sudocheck () {
+  for COMMAND in "$@"
+  do
+    if ! sudo -n "$@" > /dev/null 2>&1
+    then
+      desktopctl.log "sudocheck: Error: You don't have sufficient permissions to execute '$COMMAND'."
+    fi
+done
+}
+# }}}}}
+# Rounding calculator {{{{{
+desktopctl.bcr () {
+    bc -l <<EOF
+t=$1
+scale=${2:-2}
+
+(t*10^scale+((t>0)-(t<0))/2)/10^scale
+EOF
+}
+# }}}}}
+
+# Session Authentication {{{{{
+desktopctl.session_auth.usage () {
+cat <<EOF
+[desktopctl] Session authentiaction check
+
+Prints whether the session is correctly authenticated using loginctl
+
+Arguments: None
+
+Reference: https://wiki.archlinux.org/title/General_troubleshooting#Session_permissions
+EOF
+}
+
+desktopctl.session_auth.check () {
+  # This is rather crude
+  # In theory this should be able to detect when a session is not properly
+  # authenticated, but it is difficult to use this in practice: in practice one
+  # would like a notification to somehow warn the user that their session is not
+  # properly authenticated. For example, this script is started by a user
+  # systemd unit after login: but since this often runs in a different
+  # environmental context, the loginctl will tell the background script that
+  # things are okay, when running the script from the terminal will tell you
+  # that they're not.
+  #
+  # https://wiki.archlinux.org/title/General_troubleshooting#Session_permissions
+
+  if [[ $(loginctl show-session --property=Active --property=Remote self | sort | paste -sd' ') != 'Active=yes Remote=no' ]]
+  then
+    if [[ $1 != -q ]]
+    then
+      echo "Session *not* properly authenticated"
+    fi
+    exit 1
+  else
+    if [[ $1 != -q ]]
+    then
+      echo "desktopctl: Session properly authenticated"
+    fi
+  fi
+}
+
+desktopctl.session_auth () {
+  case "$1" in
+    '') desktopctl.session_auth.check ;;
+    *) desktopctl.session_auth.usage ;;
+  esac
+}
+# }}}}}
+# Backlight {{{{{
+desktopctl.backlight.usage () {
+cat <<EOF
+[desktopctl] Backlight Management
+
+Arguments:
+  NUMBER,        Set backlight to NUMBER percentage.
+  +NUMBER,       Increase backlight percentage by NUMBER.
+  -NUMBER,       Decrease backlight percentage by NUMBER.
+
+  +,             Go to the next backlight intensity level.
+  -,             Go to the previous backlight intensity level.
+
+  -p, --print,   Print current backlight percentages.
+  -n, --notify,  Send desktop notification with current backlight intensity.
+  -h, --help,    Display this help.
+
+Can be configured by setting BACKLIGHT_LEVELS in configuration file
+
+Default is
+BACKLIGHT_LEVELS=(0 1 2 3 4 5 6 7 8 9 10 15 20 25 30 40 50 60 70 80 90 100)
+
+Uses 'xbacklight' under the hood.
+EOF
+}
+
+desktopctl.backlight.notify () {
+  notify-send              \
+    "backlight: $(desktopctl.backlight.get)" \
+    -t 5000              \
+    -h string:x-canonical-private-synchronous:backlight
+}
+
+desktopctl.backlight.get () {
+  # Get current backlight intensity as a percentage
+  #
+  # Arguments: None
+
+  xbacklight -get
+}
+
+desktopctl.backlight.set () {
+  # Set the backlight to a given intensity percentage
+  #
+  # Arguments:
+  #   (1) Backlight intensity - Number between 0-100 (inclusive)
+
+  xbacklight -set "$1"
+}
+
+desktopctl.backlight.inc () {
+  # Increase the backlight intensity by a given number of percentage points
+  #
+  # Arguments:
+  #   (1) Backlight intensity increase - Number between 0-100 (inclusive)
+
+  xbacklight -inc "$1"
+}
+
+desktopctl.backlight.dec () {
+  # Decrease the backlight intensity by a given number of percentage points
+  #
+  # Arguments:
+  #   (1) Backlight intensity decrease - Number between 0-100 (inclusive)
+
+  xbacklight -dec "$1"
+}
+
+desktopctl.backlight.get_level () {
+  # Get current backlight intensity as an intensity level
+  #
+  # Arguments: None
+
+  # Current backlight intensity
+  CURRENT=$(desktopctl.backlight.get)
+
+  # Iter over all level intervals, to see in which level interval the current
+  # brightness falls
+
+  level=0
+  for level in "${!BACKLIGHT_LEVELS[@]}"
+  do
+    if (( CURRENT == ${BACKLIGHT_LEVELS[$level]} )) || \
+      (\
+        (( ${BACKLIGHT_LEVELS[$level]} < CURRENT )) \
+        && \
+        (( CURRENT < ${BACKLIGHT_LEVELS[$((level+1))]} ))
+      )
+    then
+      echo "$level"
+    fi
+  done
+}
+
+desktopctl.backlight.set_level () {
+  # Set current backlight intensity as an intensity level
+  #
+  # Arguments:
+  #   (1) Backlight intensity level - Number between 0-20 (inclusive)
+
+  if [[ ${BACKLIGHT_LEVELS[$1]} =~ ^[0-9]+$ ]]
+  then
+    desktopctl.backlight.set "${BACKLIGHT_LEVELS[$1]}"
+  else
+    desktopctl.log "backlight: Error '$1' is not one of the specified levels: '${!BACKLIGHT_LEVELS[*]}'"
+  fi
+}
+
+
+desktopctl.backlight.inc_level () {
+  # Increment the backlight intensity to the next intensity level
+  #
+  # Arguments: None
+
+  CURRENT=$(desktopctl.backlight.get_level)
+
+  if (( CURRENT != ${#BACKLIGHT_LEVELS[@]} - 1 ))
+  then
+    desktopctl.backlight.set_level "$((CURRENT+1))"
+  fi
+}
+
+desktopctl.backlight.dec_level () {
+  # Decrement the backlight intensity to the previous intensity level
+  #
+  # Arguments: None
+
+  CURRENT=$(desktopctl.backlight.get_level)
+
+  if (( CURRENT != 0 ))
+  then
+    desktopctl.backlight.set_level "$((CURRENT-1))"
+  fi
+}
+
+desktopctl.backlight () {
+  desktopctl.dependencycheck acpi
+
+  case $1 in
+    +)              desktopctl.backlight.inc_level && desktopctl.backlight.notify ;;
+    -)              desktopctl.backlight.dec_level && desktopctl.backlight.notify ;;
+    ++([0-9]))      desktopctl.backlight.inc "${1#+}" && desktopctl.backlight.notify ;;
+    -+([0-9]))      desktopctl.backlight.dec "${1#-}" && desktopctl.backlight.notify ;;
+    +([0-9]))       desktopctl.backlight.set "$1" && desktopctl.backlight.notify ;;
+    -p|--print)     desktopctl.backlight.get ;;
+    -h|--help)      desktopctl.backlight.usage ;;
+    ''|-n|--notify) desktopctl.backlight.notify ;;
+    *)              desktopctl.backlight.usage ;;
+  esac
+}
+# }}}}}
+# Battery {{{{{
+desktopctl.battery.usage () {
+cat <<EOF
+[desktopctl] Battery usage
+
+Arguments:
+  power,       Current power usage (in W)
+  voltage,     Current battery voltage (in uV)
+  current,     Current battery current (in uA)
+  capacity,    Current battery capacity (in %)
+  charge,      Current battery capacity (in C)
+  charging,    Exit value 0 if charging
+  charged,     Exit value 0 if fully charged
+
+  remaining,   If on battery: remaining time until battery depleted
+               If charging: remaining time until battery full
+               (Human readable string)
+
+  info,        Statusline like information about battery
+               (May need correct font configuration)
+
+  Remaining battery is polled from acpi.
+  It should be roughly equivalent to the value of capacity/current as output by
+  desktopctl.
+
+Requires acpi
+EOF
+}
+
+desktopctl.battery.get_voltage () {
+  # Get the voltage (in uV) currently being drawn from battery as reported by
+  # UEVENT
+  #
+  # Arguments: None
+
+  # awk -F= '$1 == "POWER_SUPPLY_VOLTAGE_NOW" {print $2}' "$UEVENT"
+  cat /sys/class/power_supply/BAT0/voltage_now
+}
+
+desktopctl.battery.get_current () {
+  # Get the current (in uAmps) currently being drawn from the battery as
+  # reported by UEVENT
+  #
+  # Arguments: None
+
+  # awk -F= '$1 == "POWER_SUPPLY_CURRENT_NOW" {print $2}' "$UEVENT"
+  cat /sys/class/power_supply/BAT0/current_now
+}
+
+desktopctl.battery.calc_power () {
+  # Calculate the current power consumption in watts (W)
+  #
+  # Arguments: None
+
+  # Since the voltage and current are given in uV and uA we must divide by
+  # 10^6 twice to obtin a result in watts.
+  # bc -l <<< "scale=2; $(desktopctl.battery.get_voltage) * $(desktopctl.battery.get_current) / 10^12"
+  if cat /sys/class/power_supply/BAT0/{current_now,voltage_now} > /dev/null 2>&1
+  then
+    bc -l <<< "scale=1; $(paste -d'*' /sys/class/power_supply/BAT0/{current_now,voltage_now})/10^12"
+  else
+    echo ??
+  fi
+}
+
+desktopctl.battery.get_capacity () {
+  # Get the current battery capacity from the UEVENT file as a percentage of
+  # the last full charge
+  #
+  # Arguments: None
+
+  awk -F= '$1 == "POWER_SUPPLY_CAPACITY" {print $2}' "$UEVENT"
+}
+
+desktopctl.battery.get_charge () {
+  # Get the total charge (in coulombs) that the battery currently contains as
+  # reported by the UEVENT file
+  #
+  # Arguments: None
+
+  awk -F= '$1 == "POWER_SUPPLY_CHARGE_NOW" {print $2}' "$UEVENT"
+}
+
+desktopctl.battery.is_charging () {
+  # True if battery is charging (but not full), false otherwise.
+  #
+  # Arguments: None
+
+  grep -qF Charging "$UEVENT"
+}
+
+desktopctl.battery.is_charged () {
+  # True if battery is full, false otherwise.
+  #
+  # Arguments: None
+  grep -qF Charging "$UEVENT"
+}
+
+desktopctl.battery.remaining () {
+  # Return (in human readable format) the current time remaining time left as
+  # calculated by acpi
+  # If charging, the time until the battery is full will be displayed
+  #
+  # Arguments: None
+
+  acpi -b | awk '{print $5}' | awk -F: '{print $1 ":" $2}'
+}
+
+desktopctl.battery.info () {
+  bcr () {
+    # Rounding calculator
+    bc -l <<< "t=$1; scale=${2:-2}; (t*10^scale+((t>0)-(t<0))/2)/10^scale"
+  }
+
+  get_hist () {
+    # Crude check, to see if the battery is currently properly understood by the
+    # kernel
+    # (After plugging a laptop in, and waiting for it to charge, there can be a
+    # few seconds, where everything is confused --- noticable on usb-c machines
+    # that take 10-15 seconds to negotiate charging voltages/currents with the
+    # charging block)
+    if cat /sys/class/power_supply/BAT0/{current_now,voltage_now} > /dev/null 2>&1
+    then
+      # Read file backwards, because we want the most recent entries
+      tac "$POWERSTATS" | awk -v n=$(($1*2)) '{if ($2 !=0) {c+=$2;s+=1}; if (s==n) {printf "%.1f\n", c/n; exit}}'
+    else
+      echo ??
+    fi
+  }
+
+  PERCENTAGE=$(cat /sys/class/power_supply/BAT0/capacity)
+  BATTERY_STATUS=$(cat /sys/class/power_supply/BAT0/status)
+
+  if [[ "$BATTERY_STATUS" == "Full" ]]
+  then
+    ICON=""
+  elif [[ "$BATTERY_STATUS" == "Charging" ]]
+  then
+    ICON="${BATTERY_LEVELS_CHARGING[$((PERCENTAGE/10))]}"
+
+    BATTERY_INFO="${PERCENTAGE}%${ICON} $(desktopctl.battery.calc_power)W"
+  else
+    ICON="${BATTERY_LEVELS[$((PERCENTAGE/10))]}"
+
+    NOW=$(get_hist 5)
+    SHORT_TERM=$(get_hist 600)
+    BATTERY_INFO="${NOW}/${SHORT_TERM} ${PERCENTAGE}% ${ICON}"
+  fi
+
+  echo "$BATTERY_INFO" | sed 's/\s*$//'
+}
+
+desktopctl.battery.daemon () {
+  while true
+  do
+    TIME=$(date '+%F-%H%M%S.%N')
+    POWER=$(_power)
+    echo "$TIME $POWER" >> "$POWERSTATS"
+    sleep 1
+  done
+}
+
+desktopctl.battery () {
+  if [[ ! -r "$UEVENT" ]] ; then
+    desktopctl.log "stats: Error: Cannot read uevent file '$UEVENT'"
+    exit 1
+  fi
+
+  case "$1" in
+    voltage)   desktopctl.battery.get_voltage   ;;
+    current)   desktopctl.battery.get_current   ;;
+    power)     desktopctl.battery.calc_power    ;;
+    capacity)  desktopctl.battery.get_capacity  ;;
+    charge)    desktopctl.battery.get_charge    ;;
+    charging)  desktopctl.battery.is_charging   ;;
+    charged)   desktopctl.battery.is_charged    ;;
+    remaining) desktopctl.battery.remaining     ;;
+    info)      desktopctl.battery.info          ;;
+    *)         desktopctl.battery.usage         ;;
+  esac
+}
+# }}}}}
+# Bluetooth {{{{{
+desktopctl.bt.usage () {
+cat <<EOF
+[desktopctl] Bluetooth management
+
+Arguments:
+  on,                           Power bluetooth on
+  off,                          Power bluetooth off
+  --daemon, daemon,             Interact with the bluetooth daemon
+  -i, --indicator,              Print current bluetooth connection indicator
+  -l, --list, list,             List connected bluetooth devicees
+  -r, --restart, restart,       Restart bluetooth
+  -c, --connect, connect,       Connect to bluetooth device
+  -d, --disconnect, disconnect, Connect to bluetooth device
+  -h, --help, help,             Print this help
+
+To display battery status of bluetooth devices, experimental features must be
+enabled in /etc/bluetooth/main.conf in the [General] section by setting
+
+  Experimental = true
+EOF
+}
+
+desktopctl.bt.is_powered () {
+  if [[ $1 == -v ]]
+  then
+    if desktopctl.bt.is_powered
+    then
+      echo "bt: Bluetooth is powered on"
+      # Do not mask the return value of desktopctl.bt.is_powered
+      true
+    else
+      echo "bt: Bluetooth is powered off"
+      # Do not mask the return value of desktopctl.bt.is_powered
+      false
+    fi
+  else
+    [[ $(bluetoothctl show | awk '/Powered/ {print $2}') == yes ]]
+  fi
+}
+
+desktopctl.bt.power_off () {
+  # Uses rfkill under the hood
+  # 'bluetooth' command is supplied by package 'tlp'
+  bluetooth off > /dev/null 2>&1
+}
+
+desktopctl.bt.power_on () {
+  sudo systemctl start bluetooth
+  # Uses rfkill under the hood
+  # 'bluetooth' command is supplied by package 'tlp'
+  bluetooth on > /dev/null 2>&1
+  sleep 0.5
+  if ! bluetoothctl power on > /dev/null 2>&1
+  then
+    echo "desktopctl: bt: Bluez not ready"
+  fi
+}
+
+desktopctl.bt.list_connected_devices () {
+  if [[ $1 == '-1' ]]
+  then
+    if ! desktopctl.bt.is_powered
+    then
+      exit 1
+    fi
+    bluetoothctl devices                                       \
+      | awk '{print $2}'                                       \
+      | while read -r UUID; do bluetoothctl info "$UUID"; done \
+      | awk '/Name|Connected|Battery/ {print $2}'              \
+      | paste - - -                                            \
+      | awk '$2 == "yes" {print $1}'                           \
+      | paste -sd' '
+  else
+    if ! desktopctl.bt.is_powered -v
+    then
+      exit 1
+    fi
+    echo
+    bluetoothctl devices                                       \
+      | awk '{print $2}'                                       \
+      | while read -r UUID; do bluetoothctl info "$UUID"; done \
+      | awk '/Name|Connected/ {print $2}'                      \
+      | paste - -                                              \
+      | column -t -N Device,Connected                          \
+      | sed 's/^/    /'
+
+    echo
+  fi
+}
+
+desktopctl.bt.restart () {
+  echo -n "Restarting bluetooth ..."
+  systemctl restart bluetooth --quiet
+  echo -e "\r[Done] Restarting bluetooth."
+
+  # Unblock bluetooth availablility
+  desktopctl.bt.power_on
+
+  echo -n "Powering on bluetooth radio..."
+  bluetoothctl power on > /dev/null 2>&1
+  echo -e "\r[Done] Powering on bluetooth radio."
+
+  echo -n "Starting agent..."
+  bluetoothctl agent on > /dev/null 2>&1
+  bluetoothctl default-agent > /dev/null 2>&1
+  echo -e "\r[Done] Starting agent..."
+}
+
+desktopctl.bt.daemon () {
+  # Automatically turn off bluetooth if no devices are connected for 5 minutes
+
+  if (($(pgrep -u "$UID" -cxf '^.*/de bt --daemon.*') > 1))
+  then
+    echo "bt: Daemon already running."
+    exit 1
+  fi
+
+  NOT_CONNECTED=0
+  THRESHOLD=5
+  NOTIFIED=false
+
+  while true
+  do
+    if desktopctl.bt.is_powered
+    then
+      if (($(desktopctl.bt.list_connected_devices | awk 'c=0; $2 == "yes" {c++} END {print c}') == 0))
+      then
+        ((NOT_CONNECTED++))
+
+        if ((NOT_CONNECTED > "$THRESHOLD"))
+        then
+          echo "bt: Powering off bluetooth after $THRESHOLD minutes inactivity"
+          desktopctl.bt.power_off
+          notify "desktopctl: bt: Powering off bluetooth"
+          NOT_CONNECTED=0
+        fi
+        NOTIFIED=false
+      else
+        NOT_CONNECTED=0
+        if [[ $NOTIFIED == false ]]
+        then
+          echo "t: Bluetooth is powered on again, and connected to a device"
+        fi
+        NOTIFIED=true
+      fi
+    else
+      NOT_CONNECTED=0
+      NOTIFIED=false
+    fi
+
+    sleep 60
+  done &
+  exit
+}
+
+desktopctl.bt.connect () {
+  desktopctl.bt.config "$1"
+
+  echo -n "Connecting to device..."
+
+  attempt=1
+  until grep -q 'Connected: yes' <(bluetoothctl info "$ID")
+  do
+    if ((attempt % 10 == 0))
+    then
+      desktopctl.bt.restart
+    else
+      echo -en "\rConnection attempt $attempt"
+      bluetoothctl connect "$ID" > /dev/null 2>&1
+      sleep 1
+      ((attempt++))
+    fi
+  done
+  # Need trailing spaces to clean up the
+  # Connecting to device...
+  # string
+  echo -e "\rConnected              "
+}
+
+desktopctl.bt.disconnect () {
+  desktopctl.bt.config "$1"
+  bluetoothctl disconnect "$ID"
+}
+
+desktopctl.bt.indicator () {
+  if (( $(desktopctl.bt.list_connected_devices | grep -c 'yes$') != 0 ))
+  then
+    echo "$BLUETOOTH_ICON_CONNECTED"
+  elif desktopctl.bt.is_powered
+  then
+    echo "$BLUETOOTH_ICON_ON"
+  else
+    echo ""
+  fi
+}
+
+desktopctl.bt () {
+  case "$1" in
+    on)                         shift; desktopctl.bt.power_on ;;
+    off)                        shift; desktopctl.bt.power_off ;;
+    --daemon|daemon)            shift; desktopctl.bt.daemon ;;
+    -i|--indicator)             shift; desktopctl.bt.indicator ;;
+    -l|--list|list)             shift; desktopctl.bt.list_connected_devices "$@" ;;
+    -r|--restart|restart)       shift; desktopctl.bt.restart ;;
+    -c|--connect|connect)       shift; desktopctl.bt.power_on && desktopctl.bt.connect "$@" ;;
+    -d|--disconnect|disconnect) shift; desktopctl.bt.disconnect "$@" ;;
+    -h|--help|help|*)           shift; desktopctl.bt.usage ;;
+  esac
+}
+# }}}}}
+# Colour picker {{{{{
+desktopctl.colour_picker.usage () {
+cat <<EOF
+[desktopctl] Colour picker
+
+Arguments: None
+
+If using wayland, requirements are
+ - grim
+ - imagemagick
+
+If using x11, requirements are
+  - setxkbmap
+  - xclip
+  - xcolor
+  - xdotool
+EOF
+}
+
+desktopctl.colour_picker.pick () {
+  if [[ $WINDOWING == wayland ]]
+  then
+    grim -g "$(slurp -p)" -t ppm - | convert - -format '%[pixel:p{0,0}]' txt:- | tail +2 | head -1 | cut -f2- -d' ' | wl-copy
+  else
+    # Sometimes the pointer is automatically hidden, when it is not moved
+    # Starting xcolor does not unhide it
+    # We need to manually unhide it so that we can see what we aree clicking
+    setxkbmap -option grab:break_actions
+    xdotool key XF86Ungrab
+    xcolor | xclip -selection clipboard
+  fi
+}
+
+desktopctl.colour_picker () {
+  case "$1" in
+    '') shift; desktopctl.colour_picker.pick "$@" ;;
+    *)  shift; desktopctl.colour_picker.usage "$@" ;;
+  esac
+}
+# }}}}}
+# Config Diff {{{{{
+desktopctl.config_diff.usage () {
+cat <<EOF
+[desktopctl] System configuration files differences
+
+Uses configured \$DIFFTOOL to display changes of files that have been modified
+on disk from how they were originally shipped with the package manager.
+
+Arguments:
+  path, Path to configuration file
+
+Example: See changes from the default in the bluetooth configuration file, call
+
+$ desktopctl config_diff /etc/bluetooth/main.conf
+
+Only works on Archlinux.
+EOF
+}
+
+desktopctl.config_diff.diff () {
+  config=$1
+  if [[ ! -r $1 ]]
+  then
+    echo "desktopctl: Error: Cannot read file '$1'"
+    exit 1
+  fi
+  package_ver=$(pacman -Qo "$config" | awk '{printf "%s-%s\n",$(NF-1),$NF}')
+  if [[ -z $package_ver ]]
+  then
+    echo "desktopctl: Error: File '$1' is not owned by any package"
+    exit 1
+  fi
+  cache_filename=$(ls "/var/cache/pacman/pkg/$package_ver"*zst)
+  tar --to-stdout --extract "${config#/}" -f "$cache_filename" > /tmp/config
+  $DIFFTOOL "/tmp/config" "$config"
+}
+
+desktopctl.config_diff () {
+  if [[ ! -r $1 ]]
+  then
+    echo "desktopctl: Error: Cannot read file '$1'"
+    desktopctl.config_diff.usage
+    exit 1
+  else
+    desktopctl.config_diff.diff "$1"
+  fi
+}
+# }}}}}
+# CPU {{{{{
+
+desktopctl.cpu.usage () {
+cat <<EOF
+[desktopctl] CPU usage
+
+Prints '<avg CPU clock speed>/<max CPU clock speed>' in human readable form
+
+Data as reported by: '/sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq'
+
+Arguments:
+  -a, --avg, avg,    Only print average CPU clock speed over all cores
+  -m, --max, max,    Only print maximum CPU clock speed over all cores
+  -r, --raw, raw,    Do not make human readable
+
+  -h, --help, help,  Display this help
+EOF
+}
+
+desktopctl.cpu.avg () {
+  cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq | awk '{total+=$1;n+=1} END {printf "%.0f\n", total/n}'
+}
+
+desktopctl.cpu.max () {
+  cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq | sort -n | tail -1
+}
+
+desktopctl.cpu () {
+  case "$1" in
+    -h|--help|help) desktopctl.cpu.usage ;;
+    -r|--raw|raw) echo "$(desktopctl.cpu.avg)/$(desktopctl.cpu.max)" ;;
+    -a|--avg|avg) desktopctl.cpu.avg | numfmt --from-unit=1024 --to=iec --suffix=Hz ;;
+    -m|--max|max) desktopctl.cpu.max | numfmt --from-unit=1024 --to=iec --suffix=Hz ;;
+    '') echo "$(desktopctl.cpu.avg | numfmt --from-unit=1024 --to=iec --suffix=Hz)/$(desktopctl.cpu.max | numfmt --from-unit=1024 --to=iec --suffix=Hz)" ;;
+    *) desktopctl.cpu.usage ;;
+  esac
+}
+# }}}}}}
+# Headphone indicator {{{{{
+desktopctl.headphones.usage () {
+cat <<EOF
+[desktopctl] Headphones indicator
+
+Prints indicator if headphones are plugged in
+
+Arguments: None
+Options: None
+
+Uses pactl under the hood
+
+Configure the icon in the configuration file by setting HEADPHONE_INDICATOR.
+EOF
+}
+
+desktopctl.headphones.indicator () {
+  if grep -q '^\s*Active Port:.*headphones$' < <(pactl list sinks)
+  then
+    echo "$HEADPHONE_INDICATOR"
+  fi
+}
+
+desktopctl.headphones () {
+  case "$1" in
+    '') desktopctl.headphones.indicator "$@" ;;
+    *) desktopctl.headphones.usage "$@" ;;
+  esac
+}
+# }}}}}
+# Local ip {{{{{
+desktopctl.local_ip.usage () {
+cat <<EOF
+[desktopctl] Get local IP address
+
+No arguments.
+EOF
+}
+
+desktopctl.local_ip.get () {
+  ip route get 1 | sed -n 's/.*src \(\S*\) .*/\1/p'
+}
+
+desktopctl.local_ip () {
+  case "$1" in
+    '') desktopctl.local_ip.get "$@" ;;
+    *) desktopctl.local_ip.usage "$@" ;;
+  esac
+}
+# }}}}}
+# Media watch time {{{{{
+desktopctl.mediawatchtime.usage () {
+cat <<EOF
+[desktopctl] Media Watch Time
+
+Prints watch times of media with remaining time and percentage.
+
+Requires 'column' from 'util-linux'.
+
+Arguments:
+  A list of media files (mp4)
+
+Example:
+
+$ cd tv-shows/planet-earth
+$ desktopctl mediawatchtime *mp4
+Item  |   Title                                      |   Duration  |   Watched  |   % Watched  |   Remaining
+1     |  S01E01-planet-earth-from-pole-to-pole.mp4:  |  0:59       |  0:59      |  9.00        |  9:44
+2     |  S01E02-planet-earth-mountains.mp4:          |  0:57       |  1:56      |  18.00       |  8:47
+3     |  S01E03-planet-earth-fresh-water.mp4:        |  0:58       |  2:55      |  27.00       |  7:48
+4     |  S01E04-planet-earth-caves.mp4:              |  0:57       |  3:52      |  36.00       |  6:51
+5     |  S01E05-planet-earth-deserts.mp4:            |  0:57       |  4:50      |  45.00       |  5:53
+6     |  S01E06-planet-earth-ice-worlds.mp4:         |  0:58       |  5:49      |  54.00       |  4:54
+7     |  S01E07-planet-earth-great-plains.mp4:       |  0:58       |  6:48      |  63.00       |  3:55
+8     |  S01E08-planet-earth-jungles.mp4:            |  0:58       |  7:46      |  72.00       |  2:56
+9     |  S01E09-planet-earth-shallow-seas.mp4:       |  0:58       |  8:45      |  81.00       |  1:57
+10    |  S01E10-planet-earth-seasonal-forests.mp4:   |  0:58       |  9:44      |  90.00       |  0:58
+11    |  S01E11-planet-earth-ocean-deep.mp4:         |  0:58       |  10:43     |  100.00      |  0:00
+EOF
+}
+
+desktopctl.mediawatchtime.list () {
+  TMP=$(mktemp /tmp/lengths.XXX)
+
+  to_hrs () {
+    awk '{a=$1; printf "%s:%02d", int(a) , int((a - int(a))*60)""}'
+  }
+
+  to_dec () {
+    awk -F: '{print $1+$2/60+$3/3600}'
+  }
+
+  bcr () {
+    bc -l <<< "scale = 2; $*"
+  }
+
+  for vid in "$@"
+  do
+      echo -n "$vid: "
+      ffmpeg -hide_banner -i "$vid" 2>&1 | grep -o 'Duration: [^,]*'
+  done > "$TMP"
+
+  TOTAL_HOURS=$(awk '{print $3}' "$TMP" | to_dec | paste -sd+ | bc -l)
+  watched=0
+  n=0
+
+  while read -r title _ duration
+  do
+    duration=$(to_dec <<< "$duration")
+    watched=$(bcr "$watched + $duration")
+    remaining=$(bcr "$TOTAL_HOURS - $watched")
+    percentage=$(bcr "$watched/$TOTAL_HOURS*100")
+
+    duration=$(to_hrs <<< "$duration")
+    remaining=$(to_hrs <<< "$remaining")
+    ((n++))
+
+    echo "$n $title $duration $(to_hrs <<< "$watched") $percentage $remaining"
+  done < "$TMP" | column -t -o"  |  " -N "Item, Title, Duration, Watched, % Watched, Remaining"
+
+  rm "$TMP"
+}
+
+desktopctl.mediawatchtime () {
+  case "$1" in
+    ''|-h|--help|help) desktopctl.mediawatchtime.usage "$@" ;;
+    *) desktopctl.mediawatchtime.list "$@" ;;
+  esac
+}
+# }}}}}
+# Memory {{{{{
+desktopctl.memory.usage () {
+cat <<EOF
+[desktopctl] Memory
+
+Print memory usage (human readable).
+
+Options
+  -r, --raw, raw,  Display in raw bytes (not human readable).
+EOF
+}
+
+desktopctl.memory.get () {
+  # Get amount of memory being used by the computer as reported by
+  # /proc/meminfo
+  #
+  # Arguments: None
+
+  awk '{ if($0 ~ "^(MemTotal|Shmem):") {total+=$2}
+         else if($0 ~ "^(MemFree|Buffers|Cached|SReclaimable):") {total-=$2}
+       } END {print total}' /proc/meminfo
+}
+
+desktopctl.memory () {
+  case "$1" in
+    -r|--raw|raw) desktopctl.memory.get ;;
+    '') numfmt --from-unit=1024 --to=iec <<< "$(desktopctl.memory.get)" ;;
+    *) desktopctl.memory.usage ;;
+esac
+}
+# }}}}}
+# Monitor directory {{{{{
+desktopctl.mondir.usage () {
+cat <<EOF
+[desktopctl] Monitor directory for file changes
+
+Prints size, number of files in directory, and changes since last polling.
+
+Arguments:
+  dir,             Directory or file to monitor
+  -i, --interval,  Time interval to re-compute file sizes and changes in seconds
+                   (Default 60)
+
+Useful for independently monitoring file transfer progress.
+
+E.g.
+
+$ rsync /path/to/src/dir /path/to/dest/dir
+
+Forgot to add progress options! ... instead of cancelling the transfer, just
+monitor the destination directory directly
+
+$ desktopctl mondir -i 5 /path/to/dest/dir
+mondir: Monitoring '/path/to/dest/dir' with interval 5s.
+
+2024-03-30-15:23:14     Total: 188G     Files: 349222
+2024-03-30-15:23:20     Total: 188G     Files: 349266   Diff: 500MiB Files diff: 44    Speed: 100MiB/s
+2024-03-30-15:23:26     Total: 189G     Files: 349339   Diff: 525MiB Files diff: 73    Speed: 105MiB/s
+...
+
+Of course this is also useful for tools that do not offer progress statistics.
+EOF
+}
+
+desktopctl.mondir.monitor () {
+  if [[ $1 == -i ]] || [[ $1 == --interval ]]
+  then
+      if [[ $2 =~ ^[0-9]+$ ]]
+      then
+          INTERVAL=$2
+          shift
+          shift
+      else
+          echo "mondir: Error: Interval '$2' must be a non-negative integer."
+          exit 1
+      fi
+  else
+    INTERVAL=60
+  fi
+
+  if [[ ! -r $1 ]]
+  then
+    echo "mondir: Please enter a valid file/directory."
+    exit 1
+  fi
+
+  MONITOR=$1
+
+  echo "mondir: Monitoring '$MONITOR' with interval ${INTERVAL}s".
+  echo
+
+  size_pre=0
+  files_pre=0
+
+  while true
+  do
+    size=$(du -s "$MONITOR" | cut -f 1)
+    files=$(find "$MONITOR" -type f | wc -l)
+    time=$(date +"%F-%H:%M:%S")
+
+    sizediff=$((size - size_pre))
+    filediff=$((files - files_pre))
+
+    baudrate=$((sizediff / INTERVAL))
+
+    size_human=$(numfmt --from-unit=1000 --to=si <<< "$size")
+    sizediff_human=$(numfmt --from-unit=1000 --to=si <<< "$sizediff")
+    baudrate_human=$(numfmt --from-unit=1000 --to=si <<< "$baudrate")
+
+    if ((size_pre == 0)) && ((files_pre == 0))
+    then
+        printf "%s\tTotal: %s\tFiles: %s\n" "$time" "$size_human" "$files"
+    else
+        printf "%s\tTotal: %s\tFiles: %s\tDiff: %s\tFiles diff:%s\tSpeed: %s/s\n" \
+            "$time"                                                               \
+            "$size_human"                                                         \
+            "$files"                                                              \
+            "$sizediff_human"                                                     \
+            "$filediff"                                                           \
+            "$baudrate_human"
+    fi
+
+    size_pre=$size
+    files_pre=$files
+
+    sleep "$INTERVAL"
+  done
+}
+
+desktopctl.mondir () {
+  case "$1" in
+    '') desktopctl.mondir.usage "$@" ;;
+    *) desktopctl.mondir.monitor "$@" ;;
+  esac
+}
+
+# }}}}}
+# Online {{{{{
+desktopctl.online.usage () {
+cat <<EOF
+[desktopctl] Check internet connection
+
+Options:
+  -t, --timeout,   Set timeout in seconds
+  -q, --quiet,     Do not print. Only uses exit value
+
+Note: Options must be specified separately i.e. '-q -t 30' and not '-qt30' or
+'-qt 30'.
+
+Useful in scripts, to start backups or synchronise emails only when connected to
+the internet.
+EOF
+}
+
+desktopctl.online.check () {
+  time=1
+  quiet=false
+
+  while true
+  do
+    case $1 in
+      -q|--quiet)
+        shift
+        quiet=true
+        ;;
+      -t|--timeout)
+        shift
+        case $1 in
+          +([0-9]))
+            time=$1
+            ;;
+          '')
+            echo "desktopctl.online: Must specify time value"
+            return 1
+            ;;
+          *)
+            echo "desktopctl.online: $1 not a time value"
+            return 1
+        esac ;;
+      *) break ;;
+      esac
+  done
+
+  while ((time > -1))
+  do
+    # https://unix.stackexchange.com/a/190610
+    if nc -zw1 google.com 443 2>/dev/null \
+        && awk '$1 " " $2 == "SSL handshake" {getline; exit $2 != "OK"}' \
+              <(echo | openssl s_client -connect "google.com:443" 2>&1)
+    then
+      [[ $quiet == false ]] && echo "desktopctl.online: Connection was succesful!"
+      return 0
+    fi
+    if (( time > 0 ))
+    then
+      sleep 1
+    fi
+    time=$((time-1))
+  done
+  [[ $quiet == false ]] && echo "desktopctl.online: Could not connect to the internet."
+  return 1
+}
+
+desktopctl.online () {
+  case "$1" in
+    ''|-q|--quiet|-t|--timeout) desktopctl.online.check "$@" ;;
+    *) desktopctl.online.usage "$@" ;;
+  esac
+}
+# }}}}}
+# Power Management (Dell) {{{{{
+desktopctl.power.usage () {
+cat <<EOF
+[desktopctl] Power Management Options (Dell Only)
+
+Charging Profiles:
+  ac,        Primarily AC Charging, Auto performance
+  express,   Express charging, Low performance
+
+Performance:
+  auto,     Automatically adjust performance
+  cool,     Set performance profile to cool
+  desktop,  Highest performance settings
+  laptop,   Laptop performance settings
+  low,      Set perforamnce to power saving
+  quiet,    Set performance profile to quiet
+EOF
+}
+
+desktopctl.power.cool () {
+  echo "desktopctl:  Setting dell thermal profile to cool..."
+  sudo cctk --ThermalManagement=Cool > /dev/null 2>&1
+}
+desktopctl.power.quiet () {
+  echo "desktopctl:  Setting dell thermal profile to quiet..."
+  sudo cctk --ThermalManagement=Quiet > /dev/null 2>&1
+}
+desktopctl.power.ultraperformance () {
+  echo "desktopctl:  Setting dell thermal profile to UltraPerformance..."
+  sudo cctk --ThermalManagement=UltraPerformance > /dev/null 2>&1
+}
+desktopctl.power.express () {
+  echo "desktopctl:  Setting dell charging profile to express..."
+  sudo cctk --PrimaryBattChargeCfg=Express > /dev/null 2>&1
+}
+desktopctl.power.ac () {
+  echo "desktopctl:  Setting dell charging profile to AC..."
+  sudo cctk --PrimaryBattChargeCfg=AC > /dev/null 2>&1
+}
+
+desktopctl.tlp.start () {
+  echo "desktopctl:  Starting TLP in automatic mode..."
+  sudo tlp start > /dev/null 2>&1
+}
+desktopctl.tlp.ac () {
+  echo "desktopctl:  Starting TLP in AC mode..."
+  sudo tlp ac > /dev/null 2>&1
+}
+desktopctl.tlp.bat () {
+  echo "desktopctl:  Starting TLP in bat mode..."
+  sudo tlp bat > /dev/null 2>&1
+}
+
+desktopctl.governor.powersave () {
+  echo "desktopctl:  Setting CPU governor to powersave..."
+  sudo cpupower frequency-set --governor powersave > /dev/null 2>&1
+}
+desktopctl.governor.performance () {
+  echo "desktopctl:  Setting CPU governor to performance..."
+  sudo cpupower frequency-set --governor performance > /dev/null 2>&1
+}
+
+desktopctl.frequency.set () {
+  hr=$(bc -l <<< "scale=1;$1/1000000")GHz
+  echo "desktopctl:  Setting CPU frequency to $hr..."
+  sudo cpupower frequency-set --max "$1" > /dev/null 2>&1
+}
+
+desktopctl.power.desktop () {
+  desktopctl.tlp.ac
+  desktopctl.power.ultraperformance
+  desktopctl.governor.performance
+  desktopctl.frequency.set 4800000
+}
+
+desktopctl.power.laptop () {
+  desktopctl.tlp.bat
+  desktopctl.power.quiet
+  desktopctl.governor.powersave
+  desktopctl.frequency.set 2000000
+}
+
+desktopctl.power.low_power () {
+  desktopctl.tlp.bat
+  desktopctl.power.quiet
+  desktopctl.governor.powersave
+  desktopctl.frequency.set 1000000
+}
+
+desktopctl.power.auto () {
+  desktopctl.tlp.start
+  if [[ $(cat /sys/class/power_supply/AC/online) == 1 ]]
+  then
+    dunstify --replace=2393 --urgency=low "Being charged"
+    desktopctl.power.ultraperformance
+    desktopctl.governor.performance
+    desktopctl.frequency.set 4800000
+  else
+    dunstify --replace=2393 --urgency=low "On battery"
+    desktopctl.power.quiet
+    desktopctl.governor.powersave
+    desktopctl.frequency.set 2000000
+  fi
+}
+
+desktopctl.power () {
+	while true
+	do
+		case $1
+		in
+			ac)            shift; desktopctl.power.ac "$@" ;;
+			auto)          shift; desktopctl.power.auto "$@" ;;
+			cool)          shift; desktopctl.power.cool "$@" ;;
+			desktop)       shift; desktopctl.power.desktop "$@" ;;
+			express)       shift; desktopctl.power.low_power; desktopctl.power.express "$@" ;;
+			laptop)        shift; desktopctl.power.laptop "$@" ;;
+			low|low-power) shift; desktopctl.power.low_power "$@" ;;
+			quiet)         shift; desktopctl.power.quiet "$@" ;;
+			'') break ;;
+			*) shift; desktopctl.power.usage "$@" ; break ;;
+		esac
+	done
+}
+# }}}}}
+# Reboot required (Archlinux Only) {{{{{
+desktopctl.reboot-required.usage () {
+cat <<EOF
+[desktopctl] Reboot Required? (Archlinux Only)
+
+Prints information about what services need to be restarted, and whether the
+kernel is old
+
+Used to generally inform, whether the system should be rebooted
+
+Can be wrapped with pacman hook to give information after update
+
+Arguments: None
+
+Options:
+  -d, --detailed,  Print more detailed information
+EOF
+}
+
+desktopctl.reboot-required.check () {
+  running_kernel=$(uname -r)
+  if grep -qF -- '-lts' <<< "$running_kernel"
+  then
+    installed_kernel=$(file "$(pacman -Qql linux-lts | grep vmlinuz)" | awk '{for (i=1;i<NF;i++) if ($i == "version") print $(i+1)}')
+  else
+    installed_kernel=$(file "$(pacman -Qql linux | grep vmlinuz)" | awk '{for (i=1;i<NF;i++) if ($i == "version") print $(i+1)}')
+  fi
+
+  if [[ "$installed_kernel" != "$running_kernel" ]]
+  then
+    echo
+    echo -e "\e[1m:: Kernel out of date\e[0m"
+    echo
+    echo "  Currently installed: $installed_kernel > Running kernel: $running_kernel"
+    echo
+  else
+    echo "Running kernel is up to date"
+  fi
+
+  if [[ $1 == --d ]] || [[ $1 == --detailed ]]
+  then
+    declare -A affected_executables
+    while read -r executable vlibrary
+    do
+      affected_executables[$vlibrary]+=" $executable"
+    done < <(sudo lsof -n +c 0 2>/dev/null | awk '/DEL.*\/usr\/lib/ {print $1 " " $NF}' | sort -u)
+
+    if (( ${#affected_executables[@]} > 0 ))
+    then
+      echo -e "\e[1m:: Out of date libraries\e[0m\n"
+      {
+        echo "Library| Affected executables"
+        echo "-------| --------------------"
+        for vlibrary in "${!affected_executables[@]}"
+        do
+          library=$(basename "$vlibrary" | sed 's/.so.*$/.so/')
+          executables=${affected_executables[$vlibrary]}
+          executables=${executables## }
+          echo "$library| $executables"
+        done | sort -k2 -t\|
+      } | column -c 80 -Lto '  |  ' -s \| -c 80 | sed 's/^/  /'
+      echo
+    else
+      echo "No libraries out of date"
+    fi
+  else
+    executables=$(sudo lsof -n +c 0 2>/dev/null | awk '/DEL.*\/usr\/lib/ {print $1}' | sort -u)
+    if [[ -n $executables ]]
+    then
+      echo -e "\e[1m:: Out of date programs\e[0m\n"
+      sed 's/^/  /' <<< "$executables"
+    else
+      echo "No programs out of date"
+    fi
+  fi
+  echo -n "Uptime: "
+  uptime -p
+}
+
+desktopctl.reboot-required () {
+  case "$1" in
+    ''|-d|--detailed) desktopctl.reboot-required.check "$@" ;;
+    *) desktopctl.reboot-required.usage "$@" ;;
+  esac
+}
+# }}}}}
+# Screenshot {{{{{
+desktopctl.screenshot.usage () {
+cat <<EOF
+[desktopctl] Take screenshots
+
+Supports taking a partial selection of the screen
+
+Supports wayland/x11
+
+Screenshots are copied to the clipboard
+
+Arguments:
+  --select,  Will ask user to make selection of area to screenshot
+  --blurred, (x11 only) Will blur screenshot
+
+Blurred screenshots are nice for creating a lockscreen with current screen
+contents blurred.
+EOF
+}
+
+desktopctl.screenshot.screenshot () {
+  set -e
+  mkdir -p "$SCREENSHOTS"
+  SCREENSHOT="$SCREENSHOTS/screenshot-$(date +"%Y%m%d-%H%M%S").png"
+
+  if [[ $WINDOWING == wayland ]]
+  then
+    if [[ $1 == --select ]]
+    then
+      grim -g "$(slurp)" "$SCREENSHOT"
+    else
+      grim "$SCREENSHOT"
+    fi
+    wl-copy < "$SCREENSHOT"
+  else
+    if [[ $1 == --blurred ]]
+    then
+      if [[ $2 == "" ]]
+      then
+        SCREENSHOT="$HOME/.cache/blurred-screenshot.png"
+      else
+        SCREENSHOT="$2"
+      fi
+      # Ffmpeg is (surprisingly?) much faster at creating a screenshot and
+      # blurring than other tools
+      # Speed is important if this is being used to create a live blurred
+      # screenshot as the lockscreen (you don't want locking to take 30 seconds)
+      #
+      # Not sure how to get video_size in a platform independent way
+      ffmpeg -loglevel quiet -f x11grab -video_size "$SCREENSHOT_SIZE" -y -i "$DISPLAY" -filter_complex "boxblur=10:1" -vframes 1 "$SCREENSHOT"
+      exit
+    fi
+
+    if [[ $1 == --select ]]
+    then
+      setxkbmap -option grab:break_actions
+      xdotool key XF86Ungrab
+      xdotool mousemove_relative polar 90
+      import "$SCREENSHOT"
+    else
+      import -window root "$SCREENSHOT"
+    fi
+    xclip -selection clipboard "$SCREENSHOT"
+  fi
+
+  ln -nfs "$SCREENSHOT" "$SCREENSHOTS/screenshot-latest.png"
+
+  SCREENSHOT=$(basename "$SCREENSHOT")
+  notify-send "Screenshot: $SCREENSHOT"
+}
+
+desktopctl.screenshot () {
+  case "$1" in
+    ""|--select|--blurred) desktopctl.screenshot.screenshot "$@" ;;
+    *) desktopctl.screenshot.usage "$@" ;;
+  esac
+}
+# }}}}}
+# Sound {{{{{
+desktopctl.sound.usage () {
+cat <<EOF
+[desktopctl] Sound management
+
+Arguments:
+  +,               Increase volume
+  -,               Decrease volume
+  sink,            Print current default output sink
+  ismuted,         Print "yes" if muted all devices are muted, else no
+  notify,          Send a desktop notification of current volume
+  get-volume, get  Print current volume
+  mute,            Mute current default sink
+  toggle,          Toggle mute status
+
+Uses pactl under the hood
+
+Useful for displaying current volume in status line or when binding keyboard
+buttons.
+EOF
+}
+
+desktopctl.sound.mute() {
+  pactl set-sink-mute @DEFAULT_SINK@ true
+}
+
+desktopctl.sound.unmute() {
+  pactl set-sink-mute @DEFAULT_SINK@ false
+}
+
+desktopctl.sound.togglemute() {
+  pactl set-sink-mute @DEFAULT_SINK@ toggle
+}
+
+desktopctl.sound.ismuted () {
+  if grep -q no <(pactl list sinks | awk -F'\\s*:\\s*' '/Mute/ {print $2}')
+  then
+    return 1
+  else
+    return 0
+  fi
+}
+
+desktopctl.sound.volume.notify () {
+  if command -v dunstify > /dev/null
+  then
+    dunstify --replace=1 --urgency=low "$(desktopctl.sound.volume)"
+  else
+    notify-send "$(desktopctl.sound.volume)"
+  fi
+}
+
+desktopctl.sound._volume () {
+  pactl --format json list | jq -r ".sinks[] | select(.name == \"$(pactl get-default-sink)\") | .volume[] | .value_percent" | head -1
+}
+
+desktopctl.sound._equalise_volume () {
+  pactl set-sink-volume @DEFAULT_SINK@ "$(desktopctl.sound._volume)"
+}
+
+desktopctl.sound.volume () {
+  if [[ $1 == --status ]]
+  then
+    if ! desktopctl.sound.ismuted
+    then
+      desktopctl.sound._volume
+    fi
+  else
+    if desktopctl.sound.ismuted
+    then
+      echo "Muted"
+    else
+      echo "Volume: $(desktopctl.sound._volume)"
+    fi
+  fi
+}
+
+desktopctl.sound.sink () {
+  ALSA_DEFAULT_SINK=$(pactl get-default-sink)
+  DEFAULT_SINK=$(pactl list sinks | awk -v DefaultSink="$ALSA_DEFAULT_SINK" '$0 ~ DefaultSink {getline; print}' | awk -F'\\s*:\\s*' '/Description/ {print $2}')
+
+  BT_ID=$(sed 's/.*bluez_output.\(..\)_\(..\)_\(..\)_\(..\)_\(..\)_\(..\)\..*/\1:\2:\3:\4:\5:\6/' <<< "$ALSA_DEFAULT_SINK")
+
+  if ! [[ "$BT_ID" == "" ]] && [[ $(systemctl is-active bluetooth) == active ]]
+  then
+    DEFAULT_SINK="$DEFAULT_SINK ($(bluetoothctl info "$BT_ID" | awk -F: '/Battery Percentage/ {print $2}' | sed 's/.*(\(.*\))$/\1/')%)"
+  fi
+
+  # Requires pulsemixer dependency
+  # DEFAULT_SINK=$(pulsemixer --list-sinks | sed -n 's/.*Name: \([^, ]*\).*Default/\1/p')
+
+  if [[ $DEFAULT_SINK =~ (Built-in *|Tiger Lake-LP) ]]
+  then
+    # Need to print some output
+    echo
+  else
+    echo "$DEFAULT_SINK"
+  fi
+}
+
+desktopctl.sound.daemon () {
+  # Automatically mute sound if nothing is playing for a while
+
+  if (($(pgrep -u "$UID" -cxf '^.*/de sound --daemon.*') > 1))
+  then
+    desktopctl.log "sound: Daemon already running."
+    exit 1
+  fi
+
+  NOT_CONNECTED=0
+  THRESHOLD=10
+  NOTIFIED=false
+
+  while true
+  do
+    if ! desktopctl.sound.ismuted && (($(grep -c 'Corked: no' < <(pactl list sink-inputs)) == 0))
+    then
+      ((NOT_CONNECTED++))
+
+      if ((NOT_CONNECTED > "$THRESHOLD"))
+      then
+        desktopctl.log "sound: Muting sound"
+        NOT_CONNECTED=0
+        desktopctl.sound mute
+      fi
+      NOTIFIED=false
+    else
+      NOT_CONNECTED=0
+      NOTIFIED=true
+    fi
+
+    sleep 60
+  done &
+  exit
+}
+
+desktopctl.sound () {
+  case $1 in
+    "+")
+      if ! desktopctl.sound.ismuted || [[ $(desktopctl.sound.volume) = "Volume: 0%" ]]
+      then
+        if (($(desktopctl.sound._volume | sed 's/%//') > 90))
+        then
+          pactl set-sink-volume @DEFAULT_SINK@ 100%
+        else
+          pactl set-sink-volume @DEFAULT_SINK@ +5%
+        fi
+      fi
+
+      desktopctl.sound.unmute
+      desktopctl.sound.volume.notify
+      ;;
+    "-")
+      if [[ $(desktopctl.sound.volume) = "Volume: 5%" ]]
+      then
+        desktopctl.sound.mute
+      fi
+
+      pactl set-sink-volume @DEFAULT_SINK@ -5%
+      desktopctl.sound.volume.notify
+      ;;
+    "toggle")
+      pactl set-sink-mute @DEFAULT_SINK@ toggle
+      desktopctl.sound.volume.notify
+      ;;
+    "mute")
+      pactl set-sink-mute @DEFAULT_SINK@ true
+      desktopctl.sound.volume.notify
+      ;;
+    "volume"|"get-volume"|"get")
+      shift
+      desktopctl.sound.volume "$@"
+      ;;
+    "sink")
+      desktopctl.sound.sink
+      ;;
+    "ismuted")
+      if desktopctl.sound.ismuted
+      then
+        echo "True"
+      else
+        echo "False"
+        exit 2
+      fi
+      ;;
+    "playing")
+      if grep -q playing$ <(playerctl metadata -af '{{lc(status)}}' 2>/dev/null)
+      then
+        echo ""
+      elif grep -q paused$ <(playerctl metadata -af '{{lc(status)}}' 2>/dev/null)
+      then
+        echo ""
+      fi
+      ;;
+    "--daemon")
+      shift
+      desktopctl.sound.daemon
+      ;;
+    "notify")
+      desktopctl.sound.volume.notify
+      ;;
+    *)
+      desktopctl.sound.usage
+      exit 1
+      ;;
+  esac
+}
+# }}}}}
+# Speedtest {{{{{
+desktopctl.speedtest.usage () {
+cat <<EOF
+[desktopctl] Internet speedtest
+
+Very crude. Uses curl to download the file
+
+  http://eu-central-1.linodeobjects.com/speedtest/100MB-speedtest
+
+and uses pipeview to monitor the speed.
+
+Arguments: None
+EOF
+}
+
+desktopctl.speedtest.test () {
+  # --bits is a relatively new option for pipeview (pv)
+  if head /dev/null | pv --bits --format '' > /dev/null 2>&1
+    then
+    curl --silent http://eu-central-1.linodeobjects.com/speedtest/100MB-speedtest \
+      | pv --bits --wait --format 'Curr: %r Avg: %a' > /dev/null
+  else
+    curl --silent http://eu-central-1.linodeobjects.com/speedtest/100MB-speedtest \
+      | pv --wait --format 'Curr: %r Avg: %a' > /dev/null
+  fi
+}
+
+desktopctl.speedtest () {
+  case "$1" in
+    '') desktopctl.speedtest.test "$@" ;;
+    *) desktopctl.speedtest.usage "$@" ;;
+  esac
+}
+# }}}}}
+# SSH devices {{{{{
+desktopctl.ssh_devices.usage () {
+cat <<EOF
+[desktopctl] Print list of SSH devices on network
+
+Useful for finding headless machine on network after setup (e.g. Raspberry Pi)
+
+Pretty prints table with device names
+
+Arguments: None
+EOF
+}
+
+desktopctl.ssh_devices.find () {
+  local_ip=$(desktopctl.local_ip | awk -F. '{printf "%s.%s.%s.*\n", $1, $2, $3}')
+  echo "Scanning port 22 on local subnet '$local_ip'"
+  echo
+  nmap -oG - -p 22 "$local_ip" | grep -v '^#' | paste - - | awk '{ gsub("\\(|\\)", "", $3) ; gsub(".home$", "", $3) ; sub("^$", "*NO_HOSTNAME*", $3) ; print $2, $3}' | column -t -o"  |  " --table-columns="Local IP,Hostname"
+}
+
+desktopctl.ssh_devices () {
+  case "$1" in
+    '') desktopctl.ssh_devices.find "$@" ;;
+    *) desktopctl.ssh_devices.usage "$@" ;;
+  esac
+}
+# }}}}}
+# Timezone {{{{{
+desktopctl.timezone.usage () {
+cat <<EOF
+[desktopctl] Get current timezone based on IP
+
+Uses http://ip-api.com
+
+Arguments: None
+Options:
+  update,  Update timezone to current tz using timedatectl
+EOF
+}
+
+desktopctl.timezone.get () {
+  curl -SsL "http://ip-api.com/line/?fields=timezone" 2>/dev/null
+}
+
+desktopctl.timezone.update () {
+  tz=$(desktopctl.timezone)
+  if [[ -n $tz ]]
+  then
+    timedatectl set-timezone "$tz"
+  fi
+}
+
+desktopctl.timezone () {
+  case "$1" in
+    '')     desktopctl.timezone.get "$@" ;;
+    update) shift; desktopctl.timezone.update "$@" ;;
+    *)      desktopctl.timezone.usage "$@" ;;
+  esac
+}
+# }}}}}
+# Wifi {{{{{
+desktopctl.wifi.usage () {
+cat <<EOF
+[desktopctl] Wifi management
+
+Arguments:
+  ssid,       Print connected ssid
+  icons,      Print ssid with icons
+  only-icons  Only print icons
+  off,        Turn wifi off
+  on,         Turn wifi on
+EOF
+}
+
+desktopctl.wifi.info () {
+  case $WIFI_BACKEND in
+    iwd)
+      _info=$(iwctl station wlan0 show | sed '1,5d;s/\x1B\[[0-9;]\{1,\}[A-Za-z]//g;s/^\s*//;/^\s*$/d' | awk -F'\\s+\\s+' '$1 == "State" {print $2}')
+      case "$_info" in
+        "")             info=off;;
+        "disconnected") info=disconnected;;
+        "configuring")  info=configuring;;
+        "connected")    info=connected;;
+      esac
+
+      echo "$info"
+      ;;
+    nm)
+      _info=$(nmcli -g general.state device show "$WIFI_DEVICE" | grep -v '^$' | awk '{print $1}')
+      case "$_info" in
+        "20")  info=off;;
+        "30")  info=disconnected;;
+        "50")  info=configuring;;
+        "70")  info=configuring;;
+        "100") info=connected;;
+      esac
+
+      echo "$info"
+      ;;
+  esac
+}
+
+desktopctl.wifi.ssid () {
+  iwgetid -r
+
+  # Deprecated version
+  # case $WIFI_BACKEND in
+  #   iwd)
+  #     iwctl station wlan0 show | sed '1,5d;s/\x1B\[[0-9;]\{1,\}[A-Za-z]//g;s/^\s*//;/^\s*$/d' \
+  #       | awk -F'\\s+\\s+' '$1 == "Connected network" {print $2}'
+  #     ;;
+  #   nm)
+  #     nmcli -g general.connection device show "$WIFI_DEVICE"
+  #     ;;
+  # esac
+}
+
+desktopctl.wifi.strength () {
+  case $WIFI_BACKEND in
+    iwd)
+      iwctl station wlan0 show \
+        | sed '1,5d;s/\x1B\[[0-9;]\{1,\}[A-Za-z]//g;s/^\s*//;/^\s*$/d' \
+        | awk -F'\\s+\\s+' '$1 == "RSSI" {print $2}'\
+        | awk '{a=-$1;a=a<40?40:a;a=a>100?100:a;print int(100-(a-40)/60*100)}'
+      ;;
+    nm)
+      nmcli -t -f IN-USE,SIGNAL device wifi | awk -F: '/*/ {print $2}' | head -1
+      ;;
+    generic)
+      # Link quality is apparently maximal at 70
+      awk '$1 ~ /wlan0/ {gsub("\\.", "", $3); printf "%.0f\n", $3/70*100}' /proc/net/wireless
+      ;;
+  esac
+}
+
+desktopctl.wifi () {
+  info=$(desktopctl.wifi.info)
+  ssid=$(desktopctl.wifi.ssid)
+
+  _ssid=$ssid
+
+  for KNOWN_NETWORK in "${KNOWN_NETWORKS[@]}"
+  do
+    echo -n
+    if [[ "$KNOWN_NETWORK" == "$ssid" ]]
+    then
+      _ssid=""
+    fi
+  done
+
+  strength=$(desktopctl.wifi.strength)
+
+  if [[ "$strength" == "" ]]
+  then
+    WIFI_ICON_ON=$WIFI_ICON_DISCONNECTED
+  elif ((strength < 26))
+  then
+    WIFI_ICON_ON=$WIFI_ICON_LOW_STRENGTH
+  elif ((strength < 50))
+  then
+    WIFI_ICON_ON=$WIFI_ICON_MED_STRENGTH
+  else
+    WIFI_ICON_ON=$WIFI_ICON_HIG_STRENGTH
+  fi
+
+  case "$1" in
+    ssid)
+      echo "$ssid"
+      ;;
+    icons)
+      case "$info" in
+        off)          echo "$WIFI_ICON_OFF" ;;
+        disconnected) echo "$WIFI_ICON_DISCONNECTED" ;;
+        configuring)  echo "$WIFI_ICON_CONFIGURING $ssid" ;;
+        connected)    echo "$WIFI_ICON_ON $ssid" ;;
+      esac
+      ;;
+    only-icons)
+      case "$info" in
+        off)          echo "$WIFI_ICON_OFF" ;;
+        disconnected) echo "$WIFI_ICON_DISCONNECTED" ;;
+        configuring)  echo "$ssid $WIFI_ICON_CONFIGURING" ;;
+        connected)    echo "$_ssid $WIFI_ICON_ON" ;;
+      esac
+      ;;
+    off)
+      wifi off ;;
+    on)
+      wifi on ;;
+    -h|--help|help)
+      desktopctl.wifi.usage "$@" ;;
+    *)
+      case "$info" in
+        off)  echo "Off" ;;
+        disconnected)  echo "Disconnected" ;;
+        configuring)  echo "Configuring: $ssid" ;;
+        connected) echo "Connected: $ssid" ;;
+      esac
+      ;;
+  esac
+}
+# }}}}}
+# Xwayland windows (sway only) {{{{{
+desktopctl.xwayland.usage ()  {
+cat <<EOF
+[desktopctl] Xwayland windows (Sway only)
+
+Count xwayland clients
+
+Arguments:
+  format,  A format string in which '%n' will replace number of Xwayland clients
+           if there are any. If there are none, nothing will be printed.
+EOF
+}
+
+desktopctl.xwayland.count ()  {
+  xwayland_clients=0
+  verbose=false
+
+  if command -v swaymsg > /dev/null
+  then
+    xwayland_clients=$(swaymsg -t get_tree | grep -c xwayland)
+  else
+    echo "swaymsg not running..."
+    exit 2
+  fi
+
+  if [[ $1 == -v ]]
+  then
+    shift
+    verbose=true
+  fi
+
+  if [[ -z $1 ]]
+  then
+    fmt="Active xwayland clients: %n"
+  else
+    fmt=$1
+  fi
+
+  if ((xwayland_clients > 0)) || [[ $verbose == true ]]
+  then
+    echo "${fmt/\%n/$xwayland_clients}"
+  fi
+}
+
+desktopctl.xwayland () {
+  case "$1" in
+    -h|--help|help) desktopctl.xwayland.usage "$@" ;;
+    *) desktopctl.xwayland.count "$@" ;;
+  esac
+}
+# }}}}}
+
+# Help {{{{{
+desktopctl.help () {
+  echo "desktopctl: available commands"
+  echo
+  {
+    echo "auth             - Show session authentication status"
+    echo "backlight        - Get and set backlight"
+    echo "battery          - Get battery status (Percentage, Current consumption, etc)"
+    echo "bt|bluetooth     - Get and set Bluetooth"
+    echo "color|colour     - Colour picker"
+    echo "config_diff      - Show configuration file differences (Archlinux only)"
+    echo "cpu              - Get CPU frequency"
+    echo "headphones       - Get whether headpones are plugged in"
+    echo "ip               - Get local IP address"
+    echo "mediawatchtime   - Print total media time of listed files"
+    echo "memory           - Get memory usage"
+    echo "mondir           - Monitor directories/files"
+    echo "online           - Get current internet connection status"
+    echo "power            - Set power and charging profiles (Dell only)"
+    echo "reboot-required  - List programs that need to be restarted (Archlinux only)"
+    echo "screenshot       - Take screenshots"
+    echo "sound            - Get and set sound"
+    echo "speedtest        - Show current internet speed"
+    echo "ssh              - List ssh clients on local network"
+    echo "timezone|gettz   - Get current timezone"
+    echo "wifi             - Set wifi on/off"
+    echo "xwayland         - List number of xwayland clients (sway only)"
+  } | column -xc80
+  echo
+  echo "Configuration file is at ~/.config/desktopctl/desktopctlrc"
+}
+# }}}}}
+# Longhelp {{{{{
+desktopctl.longhelp () {
+  {
+  desktopctl.help
+  echo -e '\n================================================================================'
+  echo "Individual help pages"
+  echo -e '================================================================================\n'
+
+  echo -e '--------------------------------------------------------------------------------\n'
+  desktopctl.session_auth.usage
+  echo -e '\n--------------------------------------------------------------------------------\n'
+  desktopctl.backlight.usage
+  echo -e '\n--------------------------------------------------------------------------------\n'
+  desktopctl.battery.usage
+  echo -e '\n--------------------------------------------------------------------------------\n'
+  desktopctl.bt.usage
+  echo -e '\n--------------------------------------------------------------------------------\n'
+  desktopctl.cpu.usage
+  echo -e '\n--------------------------------------------------------------------------------\n'
+  desktopctl.colour_picker.usage
+  echo -e '\n--------------------------------------------------------------------------------\n'
+  desktopctl.config_diff.usage
+  echo -e '\n--------------------------------------------------------------------------------\n'
+  desktopctl.headphones.usage
+  echo -e '\n--------------------------------------------------------------------------------\n'
+  desktopctl.online.usage
+  echo -e '\n--------------------------------------------------------------------------------\n'
+  desktopctl.local_ip.usage
+  echo -e '\n--------------------------------------------------------------------------------\n'
+  desktopctl.mediawatchtime.usage
+  echo -e '\n--------------------------------------------------------------------------------\n'
+  desktopctl.memory.usage
+  echo -e '\n--------------------------------------------------------------------------------\n'
+  desktopctl.mondir.usage
+  echo -e '\n--------------------------------------------------------------------------------\n'
+  desktopctl.power.usage
+  echo -e '\n--------------------------------------------------------------------------------\n'
+  desktopctl.reboot-required.usage
+  echo -e '\n--------------------------------------------------------------------------------\n'
+  desktopctl.screenshot.usage
+  echo -e '\n--------------------------------------------------------------------------------\n'
+  desktopctl.sound.usage
+  echo -e '\n--------------------------------------------------------------------------------\n'
+  desktopctl.speedtest.usage
+  echo -e '\n--------------------------------------------------------------------------------\n'
+  desktopctl.ssh_devices.usage
+  echo -e '\n--------------------------------------------------------------------------------\n'
+  desktopctl.timezone.usage
+  echo -e '\n--------------------------------------------------------------------------------\n'
+  desktopctl.wifi.usage
+  echo -e '\n--------------------------------------------------------------------------------\n'
+  desktopctl.xwayland.usage
+
+  } | less
+}
+# }}}}}
+
+case $1 in
+  auth)            shift; desktopctl.session_auth "$@" ;;
+  backlight)       shift; desktopctl.backlight "$@" ;;
+  battery)         shift; desktopctl.battery "$@" ;;
+  bt|bluetooth)    shift; desktopctl.bt "$@" ;;
+  color|colour)    shift; desktopctl.colour_picker "$@" ;;
+  config_diff)     shift; desktopctl.config_diff "$@" ;;
+  cpu)             shift; desktopctl.cpu "$@" ;;
+  headphones)      shift; desktopctl.headphones "$@" ;;
+  ip)              shift; desktopctl.local_ip "$@" ;;
+  mediawatchtime)  shift; desktopctl.mediawatchtime "$@" ;;
+  memory)          shift; desktopctl.memory "$@" ;;
+	mondir)          shift; desktopctl.mondir "$@" ;;
+  online)          shift; desktopctl.online "$@" ;;
+  power)           shift; desktopctl.power "$@" ;;
+  reboot-required) shift; desktopctl.reboot-required "$@" ;;
+  screenshot)      shift; desktopctl.screenshot "$@" ;;
+  sound)           shift; desktopctl.sound "$@" ;;
+  speedtest)       shift; desktopctl.speedtest "$@" ;;
+  ssh)             shift; desktopctl.ssh_devices "$@" ;;
+  timezone|gettz)  shift; desktopctl.timezone "$@" ;;
+  wifi)            shift; desktopctl.wifi "$@" ;;
+  xwayland)        shift; desktopctl.xwayland "$@" ;;
+
+  help)            shift; desktopctl.longhelp "$@" ;;
+  *)               echo "desktopctl: '$*' is not a valid command"; desktopctl.help "$@" ;;
+esac
+
